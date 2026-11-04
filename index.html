@@ -11,6 +11,8 @@
   <meta name="apple-mobile-web-app-title" content="Shreyash">
   <link rel="apple-touch-icon" href="icon-192.png">
   <link rel="icon" href="icon-192.png">
+  <!-- SheetJS Library for Reading Excel Files -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <style>
     :root {
       --navy-dark: #0b2447;
@@ -199,7 +201,6 @@
     button.cancel-btn { background: #94a3b8; color: #fff; padding: 10px 18px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; }
     button.pay-btn { background: #16a34a; color: #fff; padding: 6px 12px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: bold; }
     button.return-btn { background: #d97706; color: #fff; padding: 6px 14px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: bold; }
-    button.logout-btn { background: #ef4444; color: #fff; padding: 6px 14px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 13px; }
 
     .list-item {
       display: flex;
@@ -322,23 +323,10 @@
       <h1>Shreyash Machinery & Hardware</h1>
       <p>Uruli Kanchan, Pune &middot; 9767635111 / 9970917681</p>
     </div>
-    <button id="logoutBtn" class="logout-btn hidden" onclick="window.firebaseAuth.logout()">Log Out</button>
   </header>
 
-  <!-- 1. LOGIN SCREEN -->
-  <div id="login-screen" class="login-container">
-    <h2>Login to Shreyash Rental</h2>
-    <p>Sign in with your email to access multi-device live sync.</p>
-    <form id="login-form">
-      <input type="email" id="login-email" placeholder="Email Address" required />
-      <input type="password" id="login-password" placeholder="Password" required />
-      <button type="submit" class="submit-btn" style="width:100%; padding:12px; margin-top:10px;">Log In</button>
-    </form>
-    <p id="login-error" style="color: #ef4444; font-weight: bold; margin-top: 15px;"></p>
-  </div>
-
-  <!-- 2. MAIN APP CONTAINER -->
-  <div id="app-screen" class="hidden">
+  <!-- MAIN APP CONTAINER -->
+  <div id="app-screen">
     <div class="container">
 
       <!-- HOME / DASHBOARD VIEW -->
@@ -389,9 +377,13 @@
       <div id="customers" class="view">
         <h2 class="section-title">Customer Management</h2>
         <div class="card">
-          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px; gap:10px;">
-            <input type="text" id="custSearch" placeholder="Search customers by name or phone..." style="margin:0; flex:1;">
-            <button class="submit-btn" onclick="openCustModal()">+ Add Customer</button>
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px; gap:10px; flex-wrap:wrap;">
+            <input type="text" id="custSearch" placeholder="Search customers by name or phone..." style="margin:0; flex:1; min-width:200px;">
+            <div style="display:flex; gap:8px;">
+              <button class="submit-btn" style="background:#16a34a;" onclick="document.getElementById('excelFileInput').click()">📁 Import Excel Contacts</button>
+              <input type="file" id="excelFileInput" accept=".xlsx, .xls" style="display:none;" onchange="importExcelContacts(event)">
+              <button class="submit-btn" onclick="openCustModal()">+ Add Customer</button>
+            </div>
           </div>
           <div id="customerListContainer"></div>
         </div>
@@ -766,18 +758,66 @@
       const idx = db.customers.findIndex(x => x.id === id);
       if(idx >= 0) db.customers[idx] = c; else db.customers.unshift(c);
       
-      // Save to Firebase Cloud DB if connected
-      if (window.firebaseDB) window.firebaseDB.saveItem('customers', id, c);
-      
       closeModal("custModal");
       saveDB();
       showToast("Customer saved successfully!");
     }
 
+    // Excel Contact Import Function
+    function importExcelContacts(e) {
+      const file = e.target.files[0];
+      e.target.value = "";
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = function(event) {
+        try {
+          const data = new Uint8Array(event.target.result);
+          const workbook = XLSX.read(data, { type: 'array' });
+          const firstSheetName = workbook.SheetNames[0];
+          const worksheet = workbook.Sheets[firstSheetName];
+          const rows = XLSX.utils.sheet_to_json(worksheet);
+
+          let importedCount = 0;
+          rows.forEach((row, idx) => {
+            const name = (row['Name'] || '').toString().trim();
+            if (!name) return;
+
+            let phone = '';
+            const rawPhone = row['Contact Number-1'];
+            if (rawPhone !== undefined && rawPhone !== null) {
+              phone = Math.floor(Number(rawPhone)).toString();
+              if (phone === 'NaN') phone = rawPhone.toString().trim();
+            }
+
+            const customerId = 'excel-' + Date.now() + '-' + idx;
+            const newCust = {
+              id: customerId,
+              name: name,
+              phone: phone !== 'undefined' ? phone : '',
+              address: 'Uruli Kanchan, Pune'
+            };
+
+            const exists = db.customers.some(c => c.name.toLowerCase() === name.toLowerCase() && c.phone === newCust.phone);
+            if (!exists) {
+              db.customers.push(newCust);
+              importedCount++;
+            }
+          });
+
+          saveDB();
+          showToast(`Successfully imported ${importedCount} contacts from Excel!`);
+        } catch (err) {
+          console.error(err);
+          alert("Failed to parse Excel file. Ensure columns are named 'Name' and 'Contact Number-1'.");
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    }
+
     function deleteCust(id) {
       if(confirm("Are you sure you want to delete this customer?")) {
         db.customers = db.customers.filter(x => x.id !== id);
-        if (window.firebaseDB) window.firebaseDB.removeItem('customers', id);
         saveDB();
         showToast("Customer deleted.");
       }
@@ -817,8 +857,6 @@
       const idx = db.items.findIndex(x => x.id === id);
       if(idx >= 0) db.items[idx] = i; else db.items.unshift(i);
 
-      if (window.firebaseDB) window.firebaseDB.saveItem('items', id, i);
-
       closeModal("itemModal");
       saveDB();
       showToast("Item / product saved!");
@@ -827,7 +865,6 @@
     function deleteItem(id) {
       if(confirm("Are you sure you want to delete this item?")) {
         db.items = db.items.filter(x => x.id !== id);
-        if (window.firebaseDB) window.firebaseDB.removeItem('items', id);
         saveDB();
         showToast("Item deleted.");
       }
@@ -1036,8 +1073,6 @@
       };
 
       db.sales.unshift(newInv);
-      if (window.firebaseDB) window.firebaseDB.saveItem('invoices', newInv.id, newInv);
-
       closeModal("saleModal");
       saveDB();
       showToast("Invoice completed & saved!");
@@ -1100,13 +1135,10 @@
       const catalogItem = db.items.find(i => i.id === itemId);
       if(catalogItem) {
         catalogItem.qty = Number(catalogItem.qty || 0) + qtyToReturn;
-        if (window.firebaseDB) window.firebaseDB.saveItem('items', catalogItem.id, catalogItem);
       }
 
       const allReturned = inv.items.every(i => (i.qty - (i.returnedQty || 0)) === 0);
       if(allReturned) inv.status = "completed";
-
-      if (window.firebaseDB) window.firebaseDB.saveItem('invoices', inv.id, inv);
 
       saveDB();
       showToast(`Returned ${qtyToReturn} x ${itemEntry.name}!`);
@@ -1134,7 +1166,6 @@
           s.advanceAmount = (s.advanceAmount || 0) + payTowardsThis;
           s.dueAmount = Math.max(0, currentDue - payTowardsThis);
           remainingPayment -= payTowardsThis;
-          if (window.firebaseDB) window.firebaseDB.saveItem('invoices', s.id, s);
         }
       });
 
@@ -1148,8 +1179,6 @@
       };
 
       db.payments.unshift(payRec);
-      if (window.firebaseDB) window.firebaseDB.saveItem('payments', payRec.id, payRec);
-
       document.getElementById("recordPaymentForm").reset();
       saveDB();
       showToast("Payment recorded successfully!");
@@ -1451,99 +1480,6 @@
     if ("serviceWorker" in navigator && location.protocol.startsWith("http")) {
       window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
     }
-  </script>
-
-  <!-- FIREBASE ENGINE & MULTI-DEVICE SYNC SCRIPT -->
-  <script type="module">
-    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
-    import { 
-      getAuth, 
-      signInWithEmailAndPassword, 
-      signOut, 
-      onAuthStateChanged 
-    } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
-    import { 
-      getFirestore, 
-      enableIndexedDbPersistence, 
-      collection, 
-      onSnapshot, 
-      doc, 
-      setDoc, 
-      deleteDoc 
-    } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
-
-    const firebaseConfig = {
-      apiKey: "AIzaSyB19Dz0a1DvTWX5sn0_K0BYjEYl48GDJm4",
-      authDomain: "shreyash-multiservices.firebaseapp.com",
-      projectId: "shreyash-multiservices",
-      storageBucket: "shreyash-multiservices.firebasestorage.app",
-      messagingSenderId: "961415959082",
-      appId: "1:961415959082:web:2327fe9ccfc8c109f66953",
-      measurementId: "G-ZP0DBQDC7Y"
-    };
-
-    const app = initializeApp(firebaseConfig);
-    const auth = getAuth(app);
-    const cloudDb = getFirestore(app);
-
-    enableIndexedDbPersistence(cloudDb).catch((err) => {
-      console.warn("Persistence note:", err.code);
-    });
-
-    onAuthStateChanged(auth, (user) => {
-      if (user) {
-        document.getElementById('login-screen')?.classList.add('hidden');
-        document.getElementById('app-screen')?.classList.remove('hidden');
-        document.getElementById('logoutBtn')?.classList.remove('hidden');
-
-        listenToCollection('customers');
-        listenToCollection('items');
-        listenToCollection('invoices');
-        listenToCollection('payments');
-      } else {
-        document.getElementById('login-screen')?.classList.remove('hidden');
-        document.getElementById('app-screen')?.classList.add('hidden');
-        document.getElementById('logoutBtn')?.classList.add('hidden');
-      }
-    });
-
-    function listenToCollection(colName) {
-      onSnapshot(collection(cloudDb, colName), (snapshot) => {
-        const cloudData = [];
-        snapshot.forEach((doc) => cloudData.push({ id: doc.id, ...doc.data() }));
-
-        if (colName === 'customers') db.customers = cloudData;
-        if (colName === 'items') db.items = cloudData;
-        if (colName === 'invoices') db.sales = cloudData;
-        if (colName === 'payments') db.payments = cloudData;
-
-        saveDB();
-      });
-    }
-
-    document.getElementById('login-form')?.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const email = document.getElementById('login-email').value;
-      const pass = document.getElementById('login-password').value;
-      const errorText = document.getElementById('login-error');
-
-      try {
-        errorText.textContent = '';
-        await signInWithEmailAndPassword(auth, email, pass);
-      } catch (err) {
-        errorText.textContent = 'Invalid email or password. Please try again.';
-      }
-    });
-
-    window.firebaseAuth = {
-      login: (email, pass) => signInWithEmailAndPassword(auth, email, pass),
-      logout: () => signOut(auth)
-    };
-
-    window.firebaseDB = {
-      saveItem: (col, id, data) => setDoc(doc(cloudDb, col, id), data, { merge: true }),
-      removeItem: (col, id) => deleteDoc(doc(cloudDb, col, id))
-    };
   </script>
 </body>
 </html>
