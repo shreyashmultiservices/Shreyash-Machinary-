@@ -392,7 +392,10 @@
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px; gap:10px;">
             <input type="text" id="custSearch" placeholder="Search customers by name or phone..." style="margin:0; flex:1;">
             <button class="submit-btn" onclick="openCustModal()">+ Add Customer</button>
+            <button class="submit-btn" style="background:#0f766e;" onclick="document.getElementById('customerExcelFile').click()">Import Excel</button>
+            <input type="file" id="customerExcelFile" accept=".xlsx,.xls,.csv" style="display:none" onchange="importCustomersFromExcel(event)">
           </div>
+          <p style="font-size:12px;color:#64748b;margin:0 0 10px;">Import your supplied 2026 contact workbook once. Existing customers are matched to avoid duplicate entries.</p>
           <div id="customerListContainer"></div>
         </div>
       </div>
@@ -616,8 +619,9 @@
 
           <div style="display:flex; gap:10px;">
             <div style="flex:1;">
-              <label>Bill Total (₹)</label>
-              <input type="number" id="saleBillAmt" readonly style="background:#f1f5f9; font-weight:bold;">
+              <label>Final Agreed Amount (₹) — editable</label>
+              <input type="number" id="saleBillAmt" min="0" step="0.01" oninput="this.dataset.userEdited='1'; calcBalanceDisplay()" style="background:#fff7ed; font-weight:bold;">
+              <small style="color:#64748b;">You may apply a relationship discount by editing this final amount. Item rates remain unchanged.</small>
             </div>
             <div style="flex:1;">
               <label>Advance Paid (₹)</label>
@@ -679,6 +683,8 @@
 
   <div id="toast" class="toast">Action successful</div>
 
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
   <!-- APPLICATION LOGIC -->
   <script>
     const KEY = "shreyashRentalPWA_v1";
@@ -687,6 +693,7 @@
       ["Tape 30M", 50, "rental"], ["Compressor Machine", 400, "rental"], ["7 Kg Breaker", 400, "rental"], 
       ["Level Batala", 20, "rental"], ["4 Inch Blade", 150, "sale"], ["Drill Bit 6mm", 50, "sale"], ["11 kg Breaker", 500, "rental"]
     ];
+
     const STARTER_CUSTOMERS = [
       {"id":"1","name":"Aadesh Shitole","phone":"9422345021","address":"Uruli Kanchan"},
       {"id":"2","name":"Aasu Kumar","phone":"9156082595","address":"Pune"}
@@ -733,6 +740,94 @@
 
     function closeModal(modalId) {
       document.getElementById(modalId).classList.remove("active");
+    }
+
+
+    // Import the user's 2026 contact directory. Matches by normalized phone first,
+    // then by exact case-insensitive name. Existing customer IDs and invoice history remain intact.
+    function normalizeCustomerImportHeader(value) {
+      return String(value || "").trim().toLowerCase().replace(/[\s_\-().]/g, "");
+    }
+
+    async function importCustomersFromExcel(event) {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+      const button = document.querySelector("#customers button[onclick*=\"customerExcelFile\"]");
+      const originalText = button ? button.textContent : "Import Excel";
+      if (button) { button.disabled = true; button.textContent = "Reading file..."; }
+
+      try {
+        if (!window.XLSX) throw new Error("Excel reader did not load. Check internet access and refresh the app.");
+        const workbook = window.XLSX.read(await file.arrayBuffer(), { type: "array" });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const rows = window.XLSX.utils.sheet_to_json(sheet, { defval: "", raw: false });
+        if (!rows.length) throw new Error("The selected worksheet is empty.");
+
+        const headerMap = {};
+        Object.keys(rows[0]).forEach(h => headerMap[normalizeCustomerImportHeader(h)] = h);
+        const findCol = names => {
+          for (const n of names) if (headerMap[n]) return headerMap[n];
+          return null;
+        };
+        const nameCol = findCol(["name", "customername", "fullname", "contactname"]);
+        const phoneCol = findCol(["contactnumber1", "contact1", "phone", "mobilenumber", "mobile", "phonenumber"]);
+        const phone2Col = findCol(["contactnumber2", "contact2", "phone2", "mobile2", "alternatemobile", "alternatenumber"]);
+        const addressCol = findCol(["address", "customeraddress", "location"]);
+        if (!nameCol) throw new Error("Name column is required in the Excel file.");
+
+        const knownNames = new Set(db.customers.map(c => String(c.name || "").trim().toLowerCase()).filter(Boolean));
+        const knownPhones = new Set(db.customers.map(c => String(c.phone || "").replace(/\D/g, "").slice(-10)).filter(Boolean));
+        const additions = [];
+        let skipped = 0;
+
+        rows.forEach((row, index) => {
+          const name = String(row[nameCol] || "").trim();
+          if (!name) { skipped++; return; }
+          const phone = phoneCol ? String(row[phoneCol] || "").trim() : "";
+          const phone2 = phone2Col ? String(row[phone2Col] || "").trim() : "";
+          const digits = phone.replace(/\D/g, "").slice(-10);
+          const key = name.toLowerCase();
+          if (knownNames.has(key) || (digits && knownPhones.has(digits))) { skipped++; return; }
+
+          additions.push({
+            id: "excel-" + Date.now() + "-" + index,
+            name,
+            phone,
+            phone2,
+            address: addressCol ? String(row[addressCol] || "").trim() : "",
+            contactSource: file.name
+          });
+          knownNames.add(key);
+          if (digits) knownPhones.add(digits);
+        });
+
+        if (!additions.length) {
+          showToast("No new customers found. Blank and duplicate rows were skipped.");
+          return;
+        }
+        if (!confirm(`File: ${file.name}\nNew customers: ${additions.length}\nSkipped blank/duplicate rows: ${skipped}\n\nImport these customers?`)) return;
+
+        db.customers = [...additions, ...db.customers];
+        saveDB();
+
+        if (window.firebaseDB?.saveItem) {
+          const batchSize = 25;
+          for (let i = 0; i < additions.length; i += batchSize) {
+            const group = additions.slice(i, i + batchSize);
+            await Promise.all(group.map(c => window.firebaseDB.saveItem("customers", c.id, c)));
+            if (button) button.textContent = `Uploading ${Math.min(i + group.length, additions.length)}/${additions.length}`;
+          }
+          showToast(`Imported ${additions.length} customers. ${skipped} duplicates/blank rows skipped.`);
+        } else {
+          showToast(`Imported ${additions.length} customers on this device. Cloud sync is not connected.`);
+        }
+      } catch (err) {
+        console.error("Excel import failed:", err);
+        alert("Import failed: " + (err.message || err));
+      } finally {
+        event.target.value = "";
+        if (button) { button.disabled = false; button.textContent = originalText; }
+      }
     }
 
     // Customer Actions
@@ -850,6 +945,8 @@
       document.getElementById("selectedCustId").value = "";
       document.getElementById("selectedItemId").value = "";
       document.getElementById("saleBillAmt").value = "0";
+      document.getElementById("saleBillAmt").dataset.userEdited = ""; 
+      document.getElementById("saleBillAmt").dataset.gross = "0";
       document.getElementById("saleAdvanceAmt").value = "0";
       document.getElementById("cartItemQty").value = "1";
       document.getElementById("cartItemRate").value = "";
@@ -981,7 +1078,11 @@
         }).join("");
       }
 
-      document.getElementById("saleBillAmt").value = grandTotal;
+      const billInput = document.getElementById("saleBillAmt");
+      const previousGross = Number(billInput.dataset.gross || 0);
+      const currentValue = Number(billInput.value || 0);
+      if (!billInput.dataset.userEdited || currentValue === previousGross) billInput.value = grandTotal;
+      billInput.dataset.gross = String(grandTotal);
       calcBalanceDisplay();
     }
 
@@ -1028,6 +1129,8 @@
         itemName: summaryText,
         items: JSON.parse(JSON.stringify(invoiceCart)),
         billAmount: billAmt,
+        grossAmount: invoiceCart.reduce((sum, item) => sum + Number(item.total || 0), 0),
+        discountAmount: Math.max(0, invoiceCart.reduce((sum, item) => sum + Number(item.total || 0), 0) - billAmt),
         advanceAmount: advAmt,
         dueAmount: Math.max(0, billAmt - advAmt),
         total: billAmt,
@@ -1065,6 +1168,7 @@
               <div>
                 <strong>${i.name}</strong><br>
                 <small style="color:#64748b;">Rented Qty: ${i.qty} | Already Returned: ${i.returnedQty || 0} | <strong>Pending: ${pending}</strong></small>
+                ${(i.returnEvents || []).map(ev => `<div style="font-size:12px;color:#166534;margin-top:4px;">Returned: ${ev.qty} Qty · ${prettyDate(ev.returnDate)} · ${ev.rentalDays} day(s) · Calculated rent: ₹${Number(ev.calculatedRentalAmount || 0).toLocaleString("en-IN")}</div>`).join("")}
               </div>
               <div>
                 ${isFullyReturned 
@@ -1094,6 +1198,23 @@
         return;
       }
 
+      const returnedAt = new Date();
+      const returnDate = isoDate(returnedAt);
+      const startDate = inv.date || isoDate(returnedAt);
+      const start = new Date(startDate + "T00:00:00");
+      const end = new Date(returnDate + "T00:00:00");
+      const rentalDays = Math.max(1, Math.floor((end - start) / 86400000) + 1);
+
+      // Keep a permanent history entry for each partial/full return.
+      itemEntry.returnEvents ||= [];
+      itemEntry.returnEvents.push({
+        qty: qtyToReturn,
+        returnDate,
+        returnDateTime: returnedAt.toISOString(),
+        rentalDays,
+        dailyRate: Number(itemEntry.rate || 0),
+        calculatedRentalAmount: Number(itemEntry.rate || 0) * rentalDays * qtyToReturn
+      });
       itemEntry.returnedQty = (itemEntry.returnedQty || 0) + qtyToReturn;
 
       // Update Catalog Stock
@@ -1377,7 +1498,7 @@
       const filteredCust = db.customers.filter(c => c.name.toLowerCase().includes(q) || c.phone.includes(q));
       document.getElementById("customerListContainer").innerHTML = filteredCust.length ? filteredCust.map(c => `
         <div class="list-item">
-          <div><strong>${c.name}</strong><br><small style="color:#64748b;">${c.phone} · ${c.address || ''}</small></div>
+          <div><strong>${c.name}</strong><br><small style="color:#64748b;">${c.phone || 'No primary number'} ${c.phone2 ? ' / ' + c.phone2 : ''} · ${c.address || ''}</small></div>
           <div>
             <button class="submit-btn" style="padding:4px 10px; font-size:12px; margin-right:5px;" onclick="openCustModal('${c.id}')">Edit</button>
             <button class="danger-btn" onclick="deleteCust('${c.id}')">Delete</button>
@@ -1412,7 +1533,8 @@
             <div>
               <strong>${s.customerName}</strong><br>
               <small style="color:#475569;">${summary}</small><br>
-              <small style="color:#64748b;">Bill: ₹${s.billAmount || s.total} · Advance: ₹${s.advanceAmount || 0} · Date: ${s.date}</small>
+              <small style="color:#64748b;">Final Bill: ₹${s.billAmount || s.total} · Advance: ₹${s.advanceAmount || 0} · Out Date: ${s.date}</small>
+              ${(s.items || []).flatMap(it => (it.returnEvents || []).map(ev => `<small style="display:block;color:#166534;">${it.name}: ${ev.qty} returned on ${prettyDate(ev.returnDate)} · ${ev.rentalDays} rental day(s)</small>`)).join("")}
             </div>
             <div style="text-align:right;">
               <strong style="color:var(--navy-dark); font-size:15px;">Total: ₹${(s.billAmount || s.total).toLocaleString("en-IN")}</strong><br>
@@ -1542,6 +1664,17 @@
 
     window.firebaseDB = {
       saveItem: (col, id, data) => setDoc(doc(cloudDb, col, id), data, { merge: true }),
+      saveItemsBatch: async (col, records) => {
+        // Firestore allows up to 500 writes per batch; use a conservative 350.
+        const batch = writeBatch(cloudDb);
+        records.forEach(record => {
+          const ref = doc(cloudDb, col, record.id);
+          const data = { ...record };
+          delete data.id;
+          batch.set(ref, data, { merge: true });
+        });
+        await batch.commit();
+      },
       removeItem: (col, id) => deleteDoc(doc(cloudDb, col, id))
     };
   </script>
